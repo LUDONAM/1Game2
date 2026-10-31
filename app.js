@@ -116,7 +116,61 @@ function finish(){
 }
 
 function chart(history,key,label){const a=history.slice(-20),max=key==='accuracy'?100:Math.max(1,...a.map(x=>x[key]));return `<svg class="chart" viewBox="0 0 800 200" role="img" aria-label="${label}. Последние ${a.length} прохождений"><text x="10" y="16">${max.toFixed(0)}</text><path d="M45 20V170H780" fill="none" stroke="#999999"/><polyline fill="none" stroke="#eeeeee" stroke-width="3" points="${a.map((x,i)=>`${50+i*720/Math.max(a.length-1,1)},${170-x[key]/max*140}`).join(' ')}"/>${a.map((x,i)=>`<circle cx="${50+i*720/Math.max(a.length-1,1)}" cy="${170-x[key]/max*140}" r="4" fill="#eeeeee"><title>${x[key].toFixed(1)}</title></circle>`).join('')}<text x="45" y="193">Раньше</text><text x="710" y="193">Сейчас</text></svg>`}
-function stats(){page='stats';run=null;const h=data.history,miss={};h.forEach(r=>Object.entries(r.mistakes||{}).forEach(([c,n])=>miss[c]=(miss[c]||0)+n));main.innerHTML=`<div class="eyebrow">Твоя практика</div><h1>Мои результаты</h1>${!h.length?'<p>Здесь появятся результаты первого пройденного задания.</p>':`<div class="metrics">${[[h.length,'занятий пройдено'],[Math.max(...h.map(x=>x.speed)),'лучшая скорость'],[Math.max(...h.map(x=>x.accuracy)).toFixed(1)+'%','лучшая точность'],[format(h.reduce((s,x)=>s+x.elapsed,0)),'всего практики']].map(([v,t])=>`<div class="metric"><strong>${v}</strong><span>${t}</span></div>`).join('')}</div><div class="card"><h2>Скорость · знаков в минуту</h2>${chart(h,'speed','Изменение скорости')}</div><div class="card"><h2>Точность · проценты</h2>${chart(h,'accuracy','Изменение точности')}</div><h2>Символы, которые требуют внимания</h2><p>${Object.entries(miss).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([c,n])=>`${esc(c===' '?'пробел':c)}: ${n}`).join(' · ')||'Пока ошибок нет.'}</p><h2>История занятий</h2><div class="tablewrap"><table><thead><tr><th>Дата</th><th>Занятие</th><th>Время</th><th>Точность</th><th>Скорость</th></tr></thead><tbody>${[...h].reverse().map(r=>`<tr><td>${new Date(r.date).toLocaleDateString('ru')}</td><td>${esc(r.title||LESSONS.find(l=>l.id===r.id)?.title||'')}</td><td>${format(r.elapsed)}</td><td>${r.accuracy.toFixed(1)}%</td><td>${r.speed}</td></tr>`).join('')}</tbody></table></div>`}`}
+const PROGRESS_LIMIT=2*1024*1024;
+let pendingProgress=null;
+function progressEnvelope(){return {format:'bukva-progress',version:1,exportedAt:new Date().toISOString(),progress:JSON.parse(JSON.stringify(data))}}
+function parseProgress(text){
+ if(typeof text!=='string'||new TextEncoder().encode(text).length>PROGRESS_LIMIT)throw Error('Файл слишком большой. Максимум — 2 МБ.');
+ let file;try{file=JSON.parse(text)}catch{throw Error('Файл повреждён или не является файлом прогресса JSON.')}
+ if(file?.format!=='bukva-progress'||file.version!==1||file.progress?.curriculum!==5)throw Error('Этот формат не поддерживается. Выбери файл, скачанный из этой версии игры.');
+ const p=file.progress;
+ const number=(v,max=1e9)=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=max;
+ const integer=(v,max)=>number(v,max)&&Number.isInteger(v);
+ const string=(v,max)=>typeof v==='string'&&v.length<=max;
+ const fail=()=>{throw Error('В файле есть некорректные результаты. Прогресс не изменён.')};
+ function counts(value){if(value===undefined)return {};if(!value||typeof value!=='object'||Array.isArray(value))fail();const out={};for(const [c,n] of Object.entries(value)){if(c.length!==1||!integer(n,1e7))fail();out[c]=n}return out}
+ function base(r){if(!r||!integer(r.id,60)||r.id<1||!integer(r.revision,5)||r.revision<1||!number(r.elapsed)||!integer(r.errors,1e7))fail();if(r.title!==undefined&&!string(r.title,300))fail();if(r.kind!==undefined&&!['course','practice'].includes(r.kind))fail();return {id:r.id,revision:r.revision,title:r.title||'',kind:r.kind||'course',elapsed:r.elapsed,errors:r.errors,mistakes:counts(r.mistakes)}}
+ if(!Array.isArray(p.history)||p.history.length>10000)fail();
+ const history=p.history.map(r=>{const out=base(r);if(!string(r.uid,200)||!r.uid||!string(r.date,40)||!Number.isFinite(Date.parse(r.date))||!number(r.accuracy,100)||!number(r.speed,1e7))fail();return {...out,uid:r.uid,date:r.date,accuracy:r.accuracy,speed:r.speed,opportunities:counts(r.opportunities)}});
+ let draft=null;
+ if(p.draft!=null){const r=p.draft;draft=base(r);if(r.text!==undefined&&(!string(r.text,20000)||!r.text))fail();if((draft.revision!==5||draft.kind==='practice')&&!r.text)fail();const text=r.text||LESSONS.find(l=>l.id===r.id)?.text;if(!text||!integer(r.pos,text.length-1))fail();draft={...draft,pos:r.pos,paused:true,mark:null};if(r.text)draft.text=r.text}
+ return {curriculum:5,history,draft};
+}
+function mergeProgress(current,incoming){
+ const seen=new Set(current.history.map(r=>r.uid));const history=[...current.history];
+ for(const r of incoming.history)if(!seen.has(r.uid)){seen.add(r.uid);history.push(r)}
+ history.sort((a,b)=>Date.parse(a.date)-Date.parse(b.date));
+ return {...current,curriculum:5,history,draft:current.draft||incoming.draft||null};
+}
+function transferMessage(message){const el=$('#transfer-status');if(el)el.textContent=message}
+function downloadProgress(){
+ try{const blob=new Blob([JSON.stringify(progressEnvelope(),null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='bukva-progress-'+new Date().toISOString().slice(0,10)+'.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);transferMessage('Файл подготовлен. Проверь загрузки браузера.')}catch{transferMessage('Не удалось подготовить файл. Попробуй ещё раз.')}
+}
+async function previewProgress(file){
+ pendingProgress=null;$('#import-preview').hidden=true;if(!file)return;
+ try{if(file.size>PROGRESS_LIMIT)throw Error('Файл слишком большой. Максимум — 2 МБ.');const incoming=parseProgress(await file.text());const merged=mergeProgress(data,incoming);pendingProgress=incoming;
+ $('#import-summary').textContent=`В файле: ${incoming.history.length} результатов. Будет добавлено: ${merged.history.length-data.history.length}. `+(data.draft?'Твоё текущее незавершённое занятие останется.':incoming.draft?'Незавершённое занятие из файла будет доступно для продолжения.':'Незавершённых занятий в файле нет.');
+ $('#import-preview').hidden=false;transferMessage('Проверь содержимое и нажми «Добавить прогресс».');
+ }catch(e){transferMessage(e.message)}
+}
+function applyProgress(){
+ if(!pendingProgress)return;const merged=mergeProgress(data,pendingProgress),added=merged.history.length-data.history.length;
+ try{localStorage.setItem('typing-data-'+(session?.user?.id||'guest'),JSON.stringify(merged))}catch{transferMessage('В браузере не удалось сохранить данные. Прежний прогресс остался без изменений.');return}
+ data=merged;pendingProgress=null;stats();transferMessage(`Готово. Добавлено результатов: ${added}. Прежняя история сохранена.`);
+ if(session){clearTimeout(cloudTimer);cloudTimer=setTimeout(syncUp,800)}
+}
+function bindProgressControls(){
+ pendingProgress=null;
+ main.insertAdjacentHTML('afterbegin',`<section class="transfer-panel" aria-label="Перенос прогресса"><div><h2>Твой прогресс — с тобой</h2><p>Сохрани копию или перенеси результаты в другой браузер.</p></div><div class="transfer-actions"><button id="export-progress">↓ Скачать прогресс</button><button id="import-progress">↑ Загрузить прогресс</button><input id="progress-file" type="file" accept=".json,application/json" hidden></div><p id="transfer-status" role="status" aria-live="polite"></p><div id="import-preview" hidden><p id="import-summary"></p><button class="primary" id="confirm-import">Добавить прогресс</button><button id="cancel-import">Отмена</button></div></section>`);
+ $('#export-progress').onclick=downloadProgress;
+ $('#import-progress').onclick=()=>$('#progress-file').click();
+ $('#progress-file').onchange=e=>{const file=e.target.files?.[0];e.target.value='';previewProgress(file)};
+ $('#confirm-import').onclick=applyProgress;
+ $('#cancel-import').onclick=()=>{pendingProgress=null;$('#import-preview').hidden=true;transferMessage('Загрузка отменена. Прогресс не изменён.')};
+}
+
+function stats(){page='stats';run=null;const h=data.history,miss={};h.forEach(r=>Object.entries(r.mistakes||{}).forEach(([c,n])=>miss[c]=(miss[c]||0)+n));main.innerHTML=`<div class="eyebrow">Твоя практика</div><h1>Мои результаты</h1>${!h.length?'<p>Здесь появятся результаты первого пройденного задания.</p>':`<div class="metrics">${[[h.length,'занятий пройдено'],[Math.max(...h.map(x=>x.speed)),'лучшая скорость'],[Math.max(...h.map(x=>x.accuracy)).toFixed(1)+'%','лучшая точность'],[format(h.reduce((s,x)=>s+x.elapsed,0)),'всего практики']].map(([v,t])=>`<div class="metric"><strong>${v}</strong><span>${t}</span></div>`).join('')}</div><div class="card"><h2>Скорость · знаков в минуту</h2>${chart(h,'speed','Изменение скорости')}</div><div class="card"><h2>Точность · проценты</h2>${chart(h,'accuracy','Изменение точности')}</div><h2>Символы, которые требуют внимания</h2><p>${Object.entries(miss).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([c,n])=>`${esc(c===' '?'пробел':c)}: ${n}`).join(' · ')||'Пока ошибок нет.'}</p><h2>История занятий</h2><div class="tablewrap"><table><thead><tr><th>Дата</th><th>Занятие</th><th>Время</th><th>Точность</th><th>Скорость</th></tr></thead><tbody>${[...h].reverse().map(r=>`<tr><td>${new Date(r.date).toLocaleDateString('ru')}</td><td>${esc(r.title||LESSONS.find(l=>l.id===r.id)?.title||'')}</td><td>${format(r.elapsed)}</td><td>${r.accuracy.toFixed(1)}%</td><td>${r.speed}</td></tr>`).join('')}</tbody></table></div>`}`;bindProgressControls()}
+
 document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>{if(run)pause();page=b.dataset.page;shell();enterPage()});$('.brand').onclick=e=>{e.preventDefault();if(run)pause();home()};$('#account').onclick=async()=>{if(run)pause();if(session){clearTimeout(cloudTimer);await syncUp();session=null;localStorage.removeItem('typing-session');load();shell();return}$('#authnote').textContent=connected?'Вход сохраняет прогресс между компьютерами.':'Регистрация пока не подключена. Можно заниматься без входа; настройки подключения описаны в инструкции.';$('#auth').showModal()};$('#closeauth').onclick=()=>$('#auth').close();$('#switchauth').onclick=()=>{register=!register;$('#authtitle').textContent=register?'Создание аккаунта':'Вход в аккаунт';$('#emailwrap').hidden=!register;$('#authform').elements.email.required=register;$('#switchauth').textContent=register?'У меня уже есть аккаунт':'Создать аккаунт';$('#authstatus').textContent=''};
 $('#authform').onsubmit=async e=>{e.preventDefault();if(!connected){$('#authstatus').textContent='Сначала подключи Supabase по инструкции.';return}const f=e.target.elements;const submit=e.target.querySelector('[type=submit]');submit.disabled=true;try{if(register){await api('/auth/v1/signup',{method:'POST',body:JSON.stringify({email:f.email.value.trim(),password:f.password.value,data:{username:f.login.value.toLowerCase()}})});$('#authstatus').textContent='Проверь почту и подтверди регистрацию. Затем войди по логину и паролю.'}else{const r=await api('/functions/v1/login',{method:'POST',body:JSON.stringify({username:f.login.value.toLowerCase(),password:f.password.value})});session=r;localStorage.setItem('typing-session',JSON.stringify(session));load();await syncDown();$('#auth').close();shell()}}catch(err){$('#authstatus').textContent=err.message}finally{submit.disabled=false}};
 $('#forgot').onclick=async()=>{if(!connected){$('#authstatus').textContent='Восстановление станет доступно после подключения Supabase.';return}const email=prompt('Укажи почту своего аккаунта:');if(!email)return;try{await api('/auth/v1/recover',{method:'POST',body:JSON.stringify({email,redirect_to:location.origin+location.pathname})});$('#authstatus').textContent='Если аккаунт существует, на почту придёт ссылка для смены пароля.'}catch(e){$('#authstatus').textContent=e.message}};
